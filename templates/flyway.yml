@@ -1,0 +1,149 @@
+# Flyway 스키마 마이그레이션 템플릿 — tetra/app/db-schema 가 include 해서 쓴다 (런북 5-B-2)
+#
+#   MR   : flyway:lint     파일 이름 · 버전 중복 · 이미 있는 파일 수정 금지 검사 (DB 접속 없음, 일반 Runner)
+#   main : flyway:driver   MySQL Connector/J 받기 + 해시 검증 → 아티팩트 (Flyway 패키지에는 MariaDB 드라이버만 있다)
+#          flyway:tenants  테넌트 스키마 목록 t_* (SHOW DATABASES) → 아티팩트
+#          flyway:info     공용 · 테넌트 스키마의 적용 상태 · 미적용 목록 (자동)
+#          flyway:migrate  공용(tetra_platform) → 테넌트(t_*) 전부, 순서대로 (수동 버튼)
+#
+# 쓰는 쪽(.gitlab-ci.yml)이 정할 것:
+#   stages: [lint, prepare, info, migrate]
+#   variables: DB_HOST (RDS 엔드포인트 — 비밀값 아님)
+#   CI/CD 변수 FLYWAY_PASSWORD — tetra_migrator 비밀번호, Protected · Masked and hidden.
+#     원본은 Secrets Manager tetra/dev/db/migrator. 바꾸면 두 곳 모두 고친다.
+#     Protected 라서 main(보호 브랜치) 파이프라인에만 들어온다 → MR 에서는 DB 에 접속하지 않는다.
+#
+# 파일 위치 (Console 의 Flyway 라이브러리와 같은 경로 — classpath:db/migration/tenant):
+#   db/migration/platform/V<n>__<설명>.sql   공용 스키마 tetra_platform
+#   db/migration/tenant/V<n>__<설명>.sql     테넌트 스키마 t_{tenant_id} (새 테넌트는 Console 이 WF5 에서 만든다)
+# 이미 적용된 파일은 고치지 않는다 — Flyway 가 체크섬으로 막는다. 바꿀 때는 새 버전 파일로.
+
+variables:
+  FLYWAY_IMAGE: flyway/flyway:13.10.0
+  MYSQL_IMAGE: mysql:8.4.11
+  CURL_IMAGE: curlimages/curl:8.22.0
+  GIT_IMAGE: alpine/git:2.52.0
+  MYSQL_CONNECTOR_VERSION: "9.7.0"
+  MYSQL_CONNECTOR_SHA256: 0353648eaa1c91e0f4020c959abf756bc866ffd583df22ae6b6f6e0cbd43eb44
+  FLYWAY_USER: tetra_migrator
+  PLATFORM_SCHEMA: tetra_platform
+
+.flyway_main_rules: &flyway_main_rules
+  - if: $CI_PIPELINE_SOURCE == "schedule"
+    when: never
+  - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+.flyway_env: &flyway_env
+  FLYWAY_URL: jdbc:mysql://${DB_HOST}:3306/?sslMode=REQUIRED&connectTimeout=10000
+  FLYWAY_JAR_DIRS: ${CI_PROJECT_DIR}/drivers
+  FLYWAY_CONNECT_RETRIES: "3"
+  FLYWAY_VALIDATE_MIGRATION_NAMING: "true"
+  FLYWAY_CLEAN_DISABLED: "true"
+  FLYWAY_OUT_OF_ORDER: "false"
+  REDGATE_DISABLE_TELEMETRY: "true"
+
+# ---------- MR: DB 없이 검사 ----------
+flyway:lint:
+  stage: lint
+  image:
+    name: $GIT_IMAGE
+    entrypoint: [""]
+  tags: [general]
+  variables:
+    GIT_DEPTH: "0" # main 과의 갈림점까지 있어야 '고친 파일'을 정확히 찾는다
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - |
+      set -eu
+      fail=0
+      for dir in db/migration/platform db/migration/tenant; do
+        [ -d "$dir" ] || { echo "폴더 없음: $dir"; fail=1; continue; }
+        for f in "$dir"/*.sql; do
+          [ -e "$f" ] || continue
+          echo "$(basename "$f")" | grep -Eq '^V[0-9]+(_[0-9]+)?__[a-z0-9_]+\.sql$' \
+            || { echo "이름 규칙 위반 (V<n>__<소문자_설명>.sql): $f"; fail=1; }
+        done
+        dup=$(ls "$dir" | sed -n 's/^V\([0-9_]*\)__.*/\1/p' | sort | uniq -d)
+        [ -z "$dup" ] || { echo "버전 중복 ($dir): $dup"; fail=1; }
+      done
+      git fetch -q origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+      changed=$(git diff --name-status "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME...HEAD" -- db/migration | grep -v '^A' || true)
+      if [ -n "$changed" ]; then
+        echo "이미 있는 마이그레이션 파일을 고치거나 지웠다 — 새 버전 파일로 바꿀 것:"
+        echo "$changed"; fail=1
+      fi
+      [ "$fail" = 0 ] && echo "lint OK"
+      exit "$fail"
+
+# ---------- main: 준비 ----------
+flyway:driver:
+  stage: prepare
+  image:
+    name: $CURL_IMAGE
+    entrypoint: [""]
+  tags: [protected]
+  rules: *flyway_main_rules
+  script:
+    - mkdir -p drivers
+    - curl -fsSL -o "drivers/mysql-connector-j-${MYSQL_CONNECTOR_VERSION}.jar"
+      "https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/${MYSQL_CONNECTOR_VERSION}/mysql-connector-j-${MYSQL_CONNECTOR_VERSION}.jar"
+    - echo "${MYSQL_CONNECTOR_SHA256}  drivers/mysql-connector-j-${MYSQL_CONNECTOR_VERSION}.jar" | sha256sum -c -
+  artifacts:
+    paths: [drivers/]
+    expire_in: 1 day
+
+flyway:tenants:
+  stage: prepare
+  image:
+    name: $MYSQL_IMAGE
+    entrypoint: [""]
+  tags: [protected]
+  rules: *flyway_main_rules
+  script:
+    # tetra_migrator 는 tetra_platform 과 t_* 만 볼 수 있다 → 목록은 테넌트 스키마뿐
+    - MYSQL_PWD="$FLYWAY_PASSWORD" mysql -h "$DB_HOST" -u "$FLYWAY_USER" --ssl-mode=REQUIRED -N -B
+      -e "SHOW DATABASES LIKE 't\\_%'" > tenants.txt
+    - echo "테넌트 스키마 $(wc -l < tenants.txt)개"; cat tenants.txt
+  artifacts:
+    paths: [tenants.txt]
+    expire_in: 1 day
+
+# ---------- main: 확인 · 적용 ----------
+.flyway_run:
+  image:
+    name: $FLYWAY_IMAGE
+    entrypoint: [""]
+  tags: [protected]
+  needs: [flyway:driver, flyway:tenants]
+  variables: *flyway_env
+  script:
+    - |
+      set -eu
+      echo "== 공용 $PLATFORM_SCHEMA"
+      flyway -schemas="$PLATFORM_SCHEMA" -locations=filesystem:db/migration/platform $FLYWAY_COMMAND
+      while read -r s; do
+        [ -n "$s" ] || continue
+        echo "== 테넌트 $s"
+        flyway -schemas="$s" -locations=filesystem:db/migration/tenant $FLYWAY_COMMAND
+      done < tenants.txt
+
+flyway:info:
+  extends: .flyway_run
+  stage: info
+  rules: *flyway_main_rules
+  variables:
+    FLYWAY_COMMAND: info
+
+flyway:migrate:
+  extends: .flyway_run
+  stage: migrate
+  needs: [flyway:driver, flyway:tenants, flyway:info]
+  resource_group: db-migrate-dev # 동시에 두 번 돌지 않게
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  variables:
+    FLYWAY_COMMAND: migrate
